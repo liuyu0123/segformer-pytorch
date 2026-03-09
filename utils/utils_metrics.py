@@ -54,7 +54,7 @@ def per_class_Precision(hist):
 def per_Accuracy(hist):
     return np.sum(np.diag(hist)) / np.maximum(np.sum(hist), 1) 
 
-def compute_mIoU(gt_dir, pred_dir, png_name_list, num_classes, name_classes=None):  
+def compute_mIoU(gt_dir, pred_dir, image_ids, num_classes, name_classes, label_suffix="_mask", label_ext=".png"):
     print('Num classes', num_classes)  
     #-----------------------------------------#
     #   创建一个全是0的矩阵，是一个混淆矩阵
@@ -65,8 +65,8 @@ def compute_mIoU(gt_dir, pred_dir, png_name_list, num_classes, name_classes=None
     #   获得验证集标签路径列表，方便直接读取
     #   获得验证集图像分割结果路径列表，方便直接读取
     #------------------------------------------------#
-    gt_imgs     = [join(gt_dir, x + ".png") for x in png_name_list]  
-    pred_imgs   = [join(pred_dir, x + ".png") for x in png_name_list]  
+    gt_imgs = [os.path.join(gt_dir, x + label_suffix + label_ext) for x in image_ids]
+    pred_imgs = [os.path.join(pred_dir, x + ".png") for x in image_ids]
 
     #------------------------------------------------#
     #   读取每一个（图片-标签）对
@@ -121,7 +121,7 @@ def compute_mIoU(gt_dir, pred_dir, png_name_list, num_classes, name_classes=None
     #   在所有验证集图像上求所有类别平均的mIoU值，计算时忽略NaN值
     #-----------------------------------------------------------------#
     print('===> mIoU: ' + str(round(np.nanmean(IoUs) * 100, 2)) + '; mPA: ' + str(round(np.nanmean(PA_Recall) * 100, 2)) + '; Accuracy: ' + str(round(per_Accuracy(hist) * 100, 2)))  
-    return np.array(hist, np.int), IoUs, PA_Recall, Precision
+    return np.array(hist, np.int64), IoUs, PA_Recall, Precision
 
 def adjust_axes(r, t, fig, axes):
     bb                  = t.get_window_extent(renderer=r)
