@@ -140,3 +140,4 @@ dmypy.json
 .pyre/
 
 img/*.jpg
+checkpoints/
