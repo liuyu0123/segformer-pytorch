@@ -75,3 +75,13 @@ python test_water.py `
 python predict.py
 #测试模型（水域分割）
 python predict_water.py
+
+#测试模型pro（水域分割，生成红色mask蒙版和csv评价指标）
+python predict_water_best_pro.py `
+    --input "D:\Files\Data\IRWSB\analyse\images" `
+    --weights "F:\AAA\5_segformer_best\experiment1\experiment1_last.pth" `
+    --output "D:\Files\GitProject\segformer-pytorch-LY\results_segformer" `
+    --ground_truth "D:\Files\Data\IRWSB\analyse\masks_pspnet" `
+    --alpha 0.5 `
+    --phi b0 `
+    --max_side 512
