@@ -2,6 +2,7 @@
 # SegFormer 版本：与 predict_water_best_pro.py 保持相同的命令行接口和评估功能
 import os
 import argparse
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -53,37 +54,58 @@ def compute_metrics(pred_mask, gt_mask):
     }
 
 def print_metrics_table(metrics_list):
-    print("\n" + "="*80)
+    print("\n" + "="*110)
     print("SegFormer 分割性能评估结果")
-    print("-"*80)
-    print(f"{'文件名':<30} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'mIoU':<10}")
-    print("-"*80)
+    print("-"*110)
+    print(f"{'文件名':<30} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'mIoU':<10} {'Time(s)':<10} {'FPS':<10}")
+    print("-"*110)
     for m in metrics_list:
+        note = " (warm-up)" if m.get('is_warmup', False) else ""
         print(f"{m['image']:<30} {m['precision']:<10.4f} {m['recall']:<10.4f} "
-              f"{m['f1']:<10.4f} {m['miou']:<10.4f}")
-    avg_p = np.mean([m['precision'] for m in metrics_list])
-    avg_r = np.mean([m['recall'] for m in metrics_list])
-    avg_f1 = np.mean([m['f1'] for m in metrics_list])
-    avg_iou = np.mean([m['miou'] for m in metrics_list])
-    print("-"*80)
-    print(f"{'[整体平均]':<30} {avg_p:<10.4f} {avg_r:<10.4f} {avg_f1:<10.4f} {avg_iou:<10.4f}")
-    print("="*80)
+              f"{m['f1']:<10.4f} {m['miou']:<10.4f} {m['inference_time']:<10.4f} {m['fps']:<10.2f}{note}")
+    avg_src = [m for m in metrics_list if not m.get('is_warmup', False)]
+    if not avg_src:
+        avg_src = metrics_list
+    avg_p = np.mean([m['precision'] for m in avg_src])
+    avg_r = np.mean([m['recall'] for m in avg_src])
+    avg_f1 = np.mean([m['f1'] for m in avg_src])
+    avg_iou = np.mean([m['miou'] for m in avg_src])
+    avg_time = np.mean([m['inference_time'] for m in avg_src])
+    avg_fps = np.mean([m['fps'] for m in avg_src])
+    print("-"*110)
+    print(f"{'[整体平均]':<30} {avg_p:<10.4f} {avg_r:<10.4f} {avg_f1:<10.4f} {avg_iou:<10.4f} {avg_time:<10.4f} {avg_fps:<10.2f}")
+    print("="*110)
+    if any(m.get('is_warmup', False) for m in metrics_list):
+        print("注：平均性能已排除 warm-up 图片的初始化时间。")
 
 def save_csv(metrics_list, save_path):
     if not metrics_list:
         return
+    avg_src = [m for m in metrics_list if not m.get('is_warmup', False)]
+    if not avg_src:
+        avg_src = metrics_list
     avg_metrics = {
         'image': 'AVERAGE',
-        'precision': np.mean([m['precision'] for m in metrics_list]),
-        'recall': np.mean([m['recall'] for m in metrics_list]),
-        'f1': np.mean([m['f1'] for m in metrics_list]),
-        'miou': np.mean([m['miou'] for m in metrics_list])
+        'precision': np.mean([m['precision'] for m in avg_src]),
+        'recall': np.mean([m['recall'] for m in avg_src]),
+        'f1': np.mean([m['f1'] for m in avg_src]),
+        'miou': np.mean([m['miou'] for m in avg_src]),
+        'inference_time': np.mean([m['inference_time'] for m in avg_src]),
+        'fps': np.mean([m['fps'] for m in avg_src])
     }
+    # 写入 CSV 时去掉 is_warmup 字段
+    clean_rows = []
+    for m in metrics_list:
+        row = {k: v for k, v in m.items() if k != 'is_warmup'}
+        clean_rows.append(row)
+    avg_row = {k: v for k, v in avg_metrics.items() if k != 'is_warmup'}
     with open(save_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['image', 'precision', 'recall', 'f1', 'miou'])
+        writer = csv.DictWriter(f, fieldnames=['image', 'precision', 'recall', 'f1', 'miou', 'inference_time', 'fps'])
         writer.writeheader()
-        writer.writerows(metrics_list + [avg_metrics])
+        writer.writerows(clean_rows + [avg_row])
     print(f"\n✓ 指标已保存至: {save_path}")
+    if any(m.get('is_warmup', False) for m in metrics_list):
+        print("注：CSV 平均行已排除 warm-up 图片的初始化时间。")
 
 def save_overlay_result(pil_img, pred_mask, save_path, alpha=0.4):
     img_array = np.array(pil_img).astype(np.float32)
@@ -154,6 +176,7 @@ def main():
     print(f"  设备: {device} | 模型: SegFormer-{args.phi.upper()}\n")
 
     metrics_list = []
+    is_first = True
 
     for img_path in input_paths:
         img_name = os.path.basename(img_path)
@@ -176,25 +199,44 @@ def main():
             # 3. 预处理（添加灰条实现不失真 resize）
             image_data, nw_real, nh_real = resize_image(image, (nw, nh))
             image_data = np.expand_dims(
-                np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 
+                np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)),
                 0
             )
 
-            # 4. 推理
+            # 4. 推理（仅计时网络前向传播，同步 CUDA 保证准确性）
+            images = torch.from_numpy(image_data).to(device)
+            is_warmup = is_first  # 标记第一次成功推理（后续排除平均）
+
+            # 显式 warm-up：第一次成功预处理时，先做不计时的 dummy forward
+            # 消除 CUDA lazy initialization / kernel compilation 导致的异常大延迟
+            if is_first:
+                with torch.no_grad():
+                    _ = net(images)[0]
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                is_first = False
+
+            if use_cuda:
+                torch.cuda.synchronize()
+            start_t = time.perf_counter()
             with torch.no_grad():
-                images = torch.from_numpy(image_data).to(device)
-                pr = net(images)[0] 
-                
-                pr = F.softmax(pr.permute(1, 2, 0), dim=-1).cpu().numpy()
-                
-                # 裁切灰条（与原始逻辑保持一致）
-                pr = pr[int((nh - nh_real) // 2) : int((nh - nh_real) // 2 + nh_real), 
-                       int((nw - nw_real) // 2) : int((nw - nw_real) // 2 + nw_real)]
-                
-                # Resize 回原图尺寸
-                pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation=cv2.INTER_LINEAR)
-                pr = pr.argmax(axis=-1)
-                
+                pr = net(images)[0]
+                if use_cuda:
+                    torch.cuda.synchronize()
+            end_t = time.perf_counter()
+            inference_time = end_t - start_t
+            fps = 1.0 / inference_time if inference_time > 0 else 0.0
+
+            pr = F.softmax(pr.permute(1, 2, 0), dim=-1).cpu().numpy()
+
+            # 裁切灰条（与原始逻辑保持一致）
+            pr = pr[int((nh - nh_real) // 2) : int((nh - nh_real) // 2 + nh_real),
+                   int((nw - nw_real) // 2) : int((nw - nw_real) // 2 + nw_real)]
+
+            # Resize 回原图尺寸
+            pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation=cv2.INTER_LINEAR)
+            pr = pr.argmax(axis=-1)
+
         except Exception as e:
             print(f"跳过 {img_name}: {e}")
             continue
@@ -212,7 +254,7 @@ def main():
                     gt_img = Image.open(gt_path).convert('L')
                     gt_np = np.array(gt_img)
                     unique_vals = np.unique(gt_np)
-                    
+
                     # 自动检测真值格式并转换
                     if len(unique_vals) <= 2 and unique_vals.max() <= 1:
                         gt_mask = gt_np.astype(np.uint8)
@@ -223,11 +265,15 @@ def main():
 
                     if gt_mask.shape != pr.shape:
                         gt_mask = cv2.resize(gt_mask, (pr.shape[1], pr.shape[0]), interpolation=cv2.INTER_NEAREST)
-                    
+
                     metrics = compute_metrics(pr, gt_mask)
                     metrics['image'] = img_name
+                    metrics['inference_time'] = inference_time
+                    metrics['fps'] = fps
+                    metrics['is_warmup'] = is_warmup
                     metrics_list.append(metrics)
-                    print(f"  处理: {img_name} | Precision: {metrics['precision']:.4f} | mIoU: {metrics['miou']:.4f}")
+                    time_note = " | warm-up" if is_warmup else ""
+                    print(f"  处理: {img_name} | Precision: {metrics['precision']:.4f} | mIoU: {metrics['miou']:.4f} | Time: {inference_time:.4f}s | FPS: {fps:.2f}{time_note}")
                 except Exception as e:
                     print(f"  警告: 真值处理失败 {img_name}: {e}")
             else:
